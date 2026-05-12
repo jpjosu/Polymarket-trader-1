@@ -1,0 +1,12 @@
+{
+  "mode": "keywords",
+  "max_markets_per_run": 100,
+  "min_hours": 1,
+  "max_hours": 12,
+  "min_liquidity": 5000,
+  "min_volume": 5000,
+  "keywords": [
+    "NBA",
+    "FOOTBALL"
+  ]
+}

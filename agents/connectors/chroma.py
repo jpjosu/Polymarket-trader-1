@@ -2,126 +2,94 @@ import json
 import os
 import time
 
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import JSONLoader
+from langchain_core.documents import Document
 from langchain_community.vectorstores.chroma import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from agents.polymarket.gamma import GammaMarketClient
 from agents.utils.objects import SimpleEvent, SimpleMarket
+
+# Embeddings locais — sem API key, roda 100% offline
+# Modelo leve (~90MB), baixa uma vez e fica em cache
+_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def get_embedding_function():
+    return HuggingFaceEmbeddings(model_name=_EMBEDDING_MODEL)
+
+
+def _safe_str(val) -> str:
+    """Converte qualquer valor para string segura para metadados do Chroma."""
+    if val is None:
+        return ""
+    return str(val)
 
 
 class PolymarketRAG:
     def __init__(self, local_db_directory=None, embedding_function=None) -> None:
         self.gamma_client = GammaMarketClient()
         self.local_db_directory = local_db_directory
-        self.embedding_function = embedding_function
-
-    def load_json_from_local(
-        self, json_file_path=None, vector_db_directory="./local_db"
-    ) -> None:
-        loader = JSONLoader(
-            file_path=json_file_path, jq_schema=".[].description", text_content=False
-        )
-        loaded_docs = loader.load()
-
-        embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
-        Chroma.from_documents(
-            loaded_docs, embedding_function, persist_directory=vector_db_directory
-        )
-
-    def create_local_markets_rag(self, local_directory="./local_db") -> None:
-        all_markets = self.gamma_client.get_all_current_markets()
-
-        if not os.path.isdir(local_directory):
-            os.mkdir(local_directory)
-
-        local_file_path = f"{local_directory}/all-current-markets_{time.time()}.json"
-
-        with open(local_file_path, "w+") as output_file:
-            json.dump(all_markets, output_file)
-
-        self.load_json_from_local(
-            json_file_path=local_file_path, vector_db_directory=local_directory
-        )
+        self.embedding_function = embedding_function or get_embedding_function()
 
     def query_local_markets_rag(
         self, local_directory=None, query=None
     ) -> "list[tuple]":
-        embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
         local_db = Chroma(
-            persist_directory=local_directory, embedding_function=embedding_function
+            persist_directory=local_directory,
+            embedding_function=self.embedding_function,
         )
         response_docs = local_db.similarity_search_with_score(query=query)
         return response_docs
 
     def events(self, events: "list[SimpleEvent]", prompt: str) -> "list[tuple]":
-        # create local json file
-        local_events_directory: str = "./local_db_events"
-        if not os.path.isdir(local_events_directory):
-            os.mkdir(local_events_directory)
-        local_file_path = f"{local_events_directory}/events.json"
-        dict_events = [x.dict() for x in events]
-        with open(local_file_path, "w+") as output_file:
-            json.dump(dict_events, output_file)
+        """Constrói vector DB de eventos e retorna os mais similares ao prompt."""
+        docs = []
+        for x in events:
+            d = x.dict() if hasattr(x, "dict") else dict(x)
+            content = d.get("description") or d.get("title") or "No description"
+            metadata = {
+                "id":      _safe_str(d.get("id")),
+                "markets": _safe_str(d.get("markets")),
+                "slug":    _safe_str(d.get("slug")),
+            }
+            docs.append(Document(page_content=content, metadata=metadata))
 
-        # create vector db
-        def metadata_func(record: dict, metadata: dict) -> dict:
+        if not docs:
+            return []
 
-            metadata["id"] = record.get("id")
-            metadata["markets"] = record.get("markets")
-
-            return metadata
-
-        loader = JSONLoader(
-            file_path=local_file_path,
-            jq_schema=".[]",
-            content_key="description",
-            text_content=False,
-            metadata_func=metadata_func,
-        )
-        loaded_docs = loader.load()
-        embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
-        vector_db_directory = f"{local_events_directory}/chroma"
         local_db = Chroma.from_documents(
-            loaded_docs, embedding_function, persist_directory=vector_db_directory
+            docs,
+            self.embedding_function,
+            persist_directory="./local_db_events/chroma",
         )
-
-        # query
         return local_db.similarity_search_with_score(query=prompt)
 
     def markets(self, markets: "list[SimpleMarket]", prompt: str) -> "list[tuple]":
-        # create local json file
-        local_events_directory: str = "./local_db_markets"
-        if not os.path.isdir(local_events_directory):
-            os.mkdir(local_events_directory)
-        local_file_path = f"{local_events_directory}/markets.json"
-        with open(local_file_path, "w+") as output_file:
-            json.dump(markets, output_file)
+        """Constrói vector DB de mercados e retorna os mais similares ao prompt."""
+        docs = []
+        for m in markets:
+            d = m if isinstance(m, dict) else m.dict()
+            content = d.get("description") or d.get("question") or "No description"
+            metadata = {
+                "id":            _safe_str(d.get("id")),
+                "outcomes":      _safe_str(d.get("outcomes")),
+                "outcome_prices":_safe_str(d.get("outcome_prices")),
+                "question":      _safe_str(d.get("question")),
+                "clob_token_ids":_safe_str(d.get("clob_token_ids")),
+                "slug":          _safe_str(d.get("slug")),
+                "end":           _safe_str(d.get("end")),
+                "event_id":      _safe_str(d.get("event_id")),
+                "event_title":   _safe_str(d.get("event_title")),
+                "event_slug":    _safe_str(d.get("event_slug")),
+            }
+            docs.append(Document(page_content=content, metadata=metadata))
 
-        # create vector db
-        def metadata_func(record: dict, metadata: dict) -> dict:
+        if not docs:
+            return []
 
-            metadata["id"] = record.get("id")
-            metadata["outcomes"] = record.get("outcomes")
-            metadata["outcome_prices"] = record.get("outcome_prices")
-            metadata["question"] = record.get("question")
-            metadata["clob_token_ids"] = record.get("clob_token_ids")
-
-            return metadata
-
-        loader = JSONLoader(
-            file_path=local_file_path,
-            jq_schema=".[]",
-            content_key="description",
-            text_content=False,
-            metadata_func=metadata_func,
-        )
-        loaded_docs = loader.load()
-        embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
-        vector_db_directory = f"{local_events_directory}/chroma"
         local_db = Chroma.from_documents(
-            loaded_docs, embedding_function, persist_directory=vector_db_directory
+            docs,
+            self.embedding_function,
+            persist_directory="./local_db_markets/chroma",
         )
-
-        # query
         return local_db.similarity_search_with_score(query=prompt)

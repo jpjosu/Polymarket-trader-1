@@ -27,6 +27,7 @@ class Trade(BaseModel):
 class SimpleMarket(BaseModel):
     id: int
     question: str
+    slug: Optional[str] = None
     # start: str
     end: str
     description: str
@@ -42,6 +43,9 @@ class SimpleMarket(BaseModel):
     outcomes: str
     outcome_prices: str
     clob_token_ids: Optional[str]
+    event_id: Optional[str] = None
+    event_title: Optional[str] = None
+    event_slug: Optional[str] = None
 
 
 class ClobReward(BaseModel):

@@ -27,3 +27,8 @@ archive.zip
 .cache
 .DS_Store
 local_db*
+paper_trades.json
+paper_trades.corrupted.json
+paper_trades.tmp
+gemini_prompt_temp.txt
+*.tmp

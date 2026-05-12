@@ -6,12 +6,18 @@ import pdb
 import time
 import ast
 import requests
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 from web3 import Web3
 from web3.constants import MAX_INT
-from web3.middleware import geth_poa_middleware
+# web3 v7 renomeou geth_poa_middleware para ExtraDataToPOAMiddleware
+try:
+    from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
+except ImportError:
+    from web3.middleware import geth_poa_middleware
 
 import httpx
 from py_clob_client.client import ClobClient
@@ -33,8 +39,25 @@ from agents.utils.objects import SimpleMarket, SimpleEvent
 load_dotenv()
 
 
+def _hours_until_end(end_str: str) -> float | None:
+    """Retorna quantas horas faltam até end_str, ou None se não conseguir parsear."""
+    if not end_str:
+        return None
+    try:
+        normalized = end_str.replace("Z", "+00:00")
+        end_dt = datetime.fromisoformat(normalized)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        diff = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+        return diff
+    except Exception:
+        return None
+
+
 class Polymarket:
-    def __init__(self) -> None:
+    def __init__(self, paper_trade: bool = True) -> None:
+        self.paper_trade = paper_trade
+        self.paper_balance = 1000.0  # USDC simulado para paper trading
         self.gamma_url = "https://gamma-api.polymarket.com"
         self.gamma_markets_endpoint = self.gamma_url + "/markets"
         self.gamma_events_endpoint = self.gamma_url + "/events"
@@ -66,8 +89,12 @@ class Polymarket:
             address=self.ctf_address, abi=self.erc1155_set_approval
         )
 
-        self._init_api_keys()
-        self._init_approvals(False)
+        if not self.paper_trade:
+            self._init_api_keys()
+            self._init_approvals(False)
+        else:
+            self.client = None
+            self.credentials = None
 
     def _init_api_keys(self) -> None:
         self.client = ClobClient(
@@ -215,21 +242,28 @@ class Polymarket:
             return self.map_api_to_market(market, token_id)
 
     def map_api_to_market(self, market, token_id: str = "") -> SimpleMarket:
+        raw_id = market.get("id", 0)
+        try:
+            parsed_id = int(raw_id)
+        except (ValueError, TypeError):
+            parsed_id = abs(hash(str(raw_id))) % (10 ** 9)
         market = {
-            "id": int(market["id"]),
-            "question": market["question"],
-            "end": market["endDate"],
-            "description": market["description"],
-            "active": market["active"],
-            # "deployed": market["deployed"],
-            "funded": market["funded"],
-            "rewardsMinSize": float(market["rewardsMinSize"]),
-            "rewardsMaxSpread": float(market["rewardsMaxSpread"]),
-            # "volume": float(market["volume"]),
-            "spread": float(market["spread"]),
-            "outcomes": str(market["outcomes"]),
-            "outcome_prices": str(market["outcomePrices"]),
-            "clob_token_ids": str(market["clobTokenIds"]),
+            "id": parsed_id,
+            "question": market.get("question", ""),
+            "slug": market.get("slug", ""),
+            "end": market.get("endDate", ""),
+            "description": market.get("description", ""),
+            "active": market.get("active", False),
+            "funded": market.get("funded", False),
+            "rewardsMinSize": float(market.get("rewardsMinSize") or 0),
+            "rewardsMaxSpread": float(market.get("rewardsMaxSpread") or 0),
+            "spread": float(market.get("spread") or 0),
+            "outcomes": str(market.get("outcomes", "[]")),
+            "outcome_prices": str(market.get("outcomePrices", "[]")),
+            "clob_token_ids": str(market.get("clobTokenIds", "[]")),
+            "event_id": str(market.get("event_id") or (market.get("events")[0].get("id") if market.get("events") else "")),
+            "event_title": str(market.get("event_title") or (market.get("events")[0].get("title") if market.get("events") else "")),
+            "event_slug": str(market.get("event_slug") or (market.get("events")[0].get("slug") if market.get("events") else "")),
         }
         if token_id:
             market["clob_token_ids"] = token_id
@@ -265,26 +299,376 @@ class Polymarket:
             "featured": event["featured"],
             "restricted": event["restricted"],
             "end": event["endDate"],
-            "markets": ",".join([x["id"] for x in event["markets"]]),
+            "markets": ",".join([str(x["id"]) for x in event["markets"]]),
         }
 
     def filter_events_for_trading(
         self, events: "list[SimpleEvent]"
     ) -> "list[SimpleEvent]":
+        # Filtra apenas status — a janela temporal é aplicada nos mercados individuais
         tradeable_events = []
         for event in events:
-            if (
-                event.active
-                and not event.restricted
-                and not event.archived
-                and not event.closed
-            ):
+            restriction_ok = self.paper_trade or not event.restricted
+            if event.active and restriction_ok and not event.archived and not event.closed:
                 tradeable_events.append(event)
         return tradeable_events
 
-    def get_all_tradeable_events(self) -> "list[SimpleEvent]":
-        all_events = self.get_all_events()
-        return self.filter_events_for_trading(all_events)
+    def filter_markets_by_end_window(
+        self, markets: "list[SimpleMarket]"
+    ) -> "list[SimpleMarket]":
+        """Mantém apenas mercados cujo endDate está dentro da janela min_hours–max_hours."""
+        cfg = self.load_focus_config()
+        min_h = float(cfg.get("min_hours", 1.0))
+        max_h = float(cfg.get("max_hours", 48.0))
+
+        kept, skipped = [], 0
+        for market in markets:
+            # map_api_to_market retorna dict; SimpleMarket usa atributo .end
+            end_val = market.get("end", "") if isinstance(market, dict) else market.end
+            hours = _hours_until_end(end_val)
+            if hours is not None and min_h <= hours <= max_h:
+                kept.append(market)
+            else:
+                skipped += 1
+
+        print(f"   Filtro temporal (mercados): {len(kept)} dentro de {min_h:.0f}h–{max_h:.0f}h, {skipped} ignorados")
+        return kept
+
+    def load_focus_config(self) -> dict:
+        import json
+        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "focus_config.json")
+        try:
+            with open(config_path) as f:
+                return json.load(f)
+        except Exception:
+            return {"mode": "all", "keywords": [], "min_volume": 0, "max_markets_per_run": 5}
+
+    def filter_events_by_focus(self, events: "list[SimpleEvent]") -> "list[SimpleEvent]":
+        config = self.load_focus_config()
+        mode = config.get("mode", "all")
+        if mode == "all":
+            return events
+        keywords = [k.lower() for k in config.get("keywords", [])]
+        min_volume = config.get("min_volume", 0)
+        if not keywords:
+            return events
+        filtered = []
+        for event in events:
+            text = f"{event.title} {event.description}".lower()
+            if any(kw in text for kw in keywords):
+                filtered.append(event)
+        print(f"   Filtro de foco: {len(filtered)}/{len(events)} eventos correspondem às keywords")
+        return filtered
+
+    def get_all_tradeable_events(self, limit: int = 100) -> "list[SimpleEvent]":
+        res = httpx.get(
+            self.gamma_events_endpoint,
+            params={"active": "true", "closed": "false", "archived": "false", "limit": limit},
+        )
+        events = []
+        if res.status_code == 200:
+            for event in res.json():
+                try:
+                    event_data = self.map_api_to_event(event)
+                    events.append(SimpleEvent(**event_data))
+                except Exception:
+                    pass
+        print(f"   API retornou {len(events)} eventos ativos")
+        events = self.filter_events_for_trading(events)   # filtra active/archived/closed
+        print(f"   Após filtro de status: {len(events)} evento(s) restantes")
+        return self.filter_events_by_focus(events)        # filtro de keywords
+
+    def _fetch_markets_page(self, params: dict, timeout: int = 20) -> "list[dict]":
+        """Faz uma única chamada ao endpoint /markets e retorna lista de dicts (ou [])."""
+        try:
+            res = httpx.get(self.gamma_markets_endpoint, params=params, timeout=timeout)
+            if res.status_code == 200:
+                return res.json()
+        except Exception as e:
+            print(f"   [_fetch_markets_page] erro: {e}")
+        return []
+
+    # ── Mapa de keywords → tag_slugs para busca via API ──
+    KEYWORD_TAG_MAP = {
+        "nba": ["nba"],
+        "soccer": ["soccer", "epl", "lal", "bun", "sea", "fl1", "ucl", "mls"],
+        "football": ["soccer", "epl", "lal", "bun", "sea", "fl1", "ucl", "mls", "nfl"],
+        "nfl": ["nfl"],
+        "premier league": ["epl"],
+        "la liga": ["lal"],
+        "champions league": ["ucl"],
+        "europa league": ["uel"],
+        "mlb": ["mlb"],
+        "nhl": ["nhl"],
+        "mma": ["mma"],
+        "ufc": ["ufc"],
+        "playoff": ["nba", "nfl", "mlb", "nhl"],
+        "championship": ["nba", "nfl", "mlb", "nhl", "ucl"],
+        "series": ["nba", "mlb", "nhl"],
+    }
+
+    def _build_tag_slugs_from_keywords(self, keywords: "list[str]") -> "list[str]":
+        """Converte keywords do focus_config em tag_slugs da Gamma API."""
+        slugs: set = set()
+        for kw in keywords:
+            mapped = self.KEYWORD_TAG_MAP.get(kw.lower(), [])
+            if mapped:
+                slugs.update(mapped)
+            else:
+                # Tenta usar a keyword diretamente como tag_slug
+                slugs.add(kw.lower().replace(" ", "-"))
+        return list(slugs)
+
+    def _extract_markets_from_events(self, events: "list[dict]", seen: set) -> "list[dict]":
+        """Extrai mercados de uma lista de eventos, preenchendo endDate/description herdados."""
+        markets: list[dict] = []
+        for event in events:
+            event_id = event.get("id", "")
+            event_end = event.get("endDate", "")
+            event_title = event.get("title", "")
+            for mkt in event.get("markets", []):
+                mid = mkt.get("id") or mkt.get("conditionId")
+                if mid and mid not in seen:
+                    seen.add(mid)
+                    mkt = dict(mkt)
+                    mkt["event_id"] = event_id
+                    mkt["event_title"] = event_title
+                    mkt["event_slug"] = event.get("slug", "")
+                    if not mkt.get("endDate"):
+                        mkt["endDate"] = event_end
+                    if not mkt.get("description"):
+                        mkt["description"] = event_title
+                    if not mkt.get("question"):
+                        mkt["question"] = event_title
+                    markets.append(mkt)
+        return markets
+
+    def _fetch_markets_by_api_filter(
+        self, min_h: float, max_h: float, tag_slugs: "list[str] | None" = None
+    ) -> "list[dict]":
+        """
+        Busca mercados DIRETAMENTE no endpoint /markets com filtros de data e tag_slug.
+        Complementa _fetch_events_by_api_filter para capturar jogos que não estão
+        aninhados em eventos (comum em NBA, futebol, etc.).
+        """
+        now = datetime.now(timezone.utc)
+        min_dt = (now + timedelta(hours=min_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        max_dt = (now + timedelta(hours=max_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        base = {
+            "active": "true",
+            "closed": "false",
+            "end_date_min": min_dt,
+            "end_date_max": max_dt,
+            "limit": 100,
+        }
+
+        all_markets: list[dict] = []
+        seen: set = set()
+
+        slugs_to_query = tag_slugs if tag_slugs else [None]
+
+        for slug in slugs_to_query:
+            offset = 0
+            while True:
+                params = {**base, "offset": offset}
+                if slug:
+                    params["tag_slug"] = slug
+                try:
+                    res = httpx.get(self.gamma_markets_endpoint, params=params, timeout=20)
+                    if res.status_code != 200:
+                        break
+                    markets = res.json()
+                except Exception as e:
+                    label = f"tag_slug={slug}" if slug else "geral"
+                    print(f"   [/markets filter] {label} erro: {e}")
+                    break
+                if not markets:
+                    break
+                for mkt in markets:
+                    mid = mkt.get("id") or mkt.get("conditionId")
+                    if mid and mid not in seen:
+                        seen.add(mid)
+                        # Preenche campos de evento se vieram aninhados em events[]
+                        if not mkt.get("event_id") and mkt.get("events"):
+                            first_evt = mkt["events"][0] if isinstance(mkt["events"], list) and mkt["events"] else {}
+                            mkt["event_id"] = first_evt.get("id", "")
+                            mkt["event_title"] = first_evt.get("title", "")
+                            mkt["event_slug"] = first_evt.get("slug", "")
+                        all_markets.append(mkt)
+                if len(markets) < 100:
+                    break
+                offset += 100
+
+        return all_markets
+
+    def _fetch_events_by_api_filter(
+        self, min_h: float, max_h: float, tag_slugs: "list[str] | None" = None
+    ) -> "list[dict]":
+        """
+        Busca eventos usando os filtros nativos da Gamma API:
+          - end_date_min / end_date_max  → janela temporal server-side
+          - tag_slug                     → filtra por esporte/categoria
+
+        Retorna lista de dicts de mercados (já extraídos dos eventos).
+        """
+        now = datetime.now(timezone.utc)
+        min_dt = (now + timedelta(hours=min_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        max_dt = (now + timedelta(hours=max_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        base = {
+            "active": "true",
+            "closed": "false",
+            "end_date_min": min_dt,
+            "end_date_max": max_dt,
+            "limit": 100,
+        }
+
+        all_markets: list[dict] = []
+        seen: set = set()
+
+        if tag_slugs:
+            # Busca por cada tag_slug separadamente (API não suporta múltiplos)
+            for slug in tag_slugs:
+                offset = 0
+                while True:
+                    params = {**base, "tag_slug": slug, "offset": offset}
+                    try:
+                        res = httpx.get(self.gamma_events_endpoint, params=params, timeout=20)
+                        if res.status_code != 200:
+                            break
+                        events = res.json()
+                    except Exception as e:
+                        print(f"   [API filter] tag_slug={slug} erro: {e}")
+                        break
+                    if not events:
+                        break
+                    mkts = self._extract_markets_from_events(events, seen)
+                    all_markets.extend(mkts)
+                    if len(events) < 100:
+                        break
+                    offset += 100
+        else:
+            # Sem tag_slug — busca geral com janela temporal
+            offset = 0
+            while True:
+                params = {**base, "offset": offset}
+                try:
+                    res = httpx.get(self.gamma_events_endpoint, params=params, timeout=20)
+                    if res.status_code != 200:
+                        break
+                    events = res.json()
+                except Exception as e:
+                    print(f"   [API filter] erro: {e}")
+                    break
+                if not events:
+                    break
+                mkts = self._extract_markets_from_events(events, seen)
+                all_markets.extend(mkts)
+                if len(events) < 100:
+                    break
+                offset += 100
+
+        return all_markets
+
+    def get_markets_closing_soon(self, limit: int = 200) -> "list[dict]":
+        """
+        Estratégia de busca usando filtros nativos da Gamma API:
+          1. /events?tag_slug=X&end_date_min=Y&end_date_max=Z  (busca principal por esporte + janela)
+          2. /events?end_date_min=Y&end_date_max=Z             (busca geral dentro da janela)
+
+        Funciona corretamente para jogos esportivos (NBA, futebol, etc.) que antes
+        não apareciam porque a API /events?q=keyword e /markets não indexam esportes.
+        """
+        cfg = self.load_focus_config()
+        min_h = float(cfg.get("min_hours", 1.0))
+        max_h = float(cfg.get("max_hours", 48.0))
+        min_liq = float(cfg.get("min_liquidity", 0.0))
+        keywords = [k.lower() for k in cfg.get("keywords", [])]
+        mode = cfg.get("mode", "all")
+
+        seen_ids: set = set()
+        final: list[dict] = []
+
+        def _add_unique(batch: "list[dict]") -> int:
+            added = 0
+            for m in batch:
+                mid = m.get("id") or m.get("conditionId") or m.get("questionID")
+                if mid and mid not in seen_ids:
+                    # Filtro Híbrido: Liquidez ou Volume 24h (para capturar CLOB e AMM)
+                    liquidity = float(m.get("liquidity") or 0)
+                    volume_24h = float(m.get("volume24h") or 0)
+                    
+                    # Se não tiver o mínimo de liquidez nem volume relevante, ignora
+                    # Usamos 10% do min_liquidity como threshold para volume se não houver liquidez reportada
+                    if min_liq:
+                        if liquidity < min_liq and volume_24h < (min_liq * 0.5):
+                            continue
+
+                    # Armazena métricas para ordenação
+                    m["_activity_score"] = liquidity + (volume_24h * 0.2)
+                    seen_ids.add(mid)
+                    final.append(m)
+                    added += 1
+            return added
+
+        # ── 1. Busca por tag_slug (esportes) — apenas /events ──
+        # Jogos esportivos no Polymarket existem SOMENTE em /events?tag_slug=X,
+        # não no endpoint /markets. Buscar /markets com tag_slug retornaria zero.
+        if keywords and mode != "all":
+            tag_slugs = self._build_tag_slugs_from_keywords(keywords)
+            print(f"   Keywords {keywords} -> tag_slugs {tag_slugs}")
+
+            sports_from_events = self._fetch_events_by_api_filter(min_h, max_h, tag_slugs)
+            added_ev = _add_unique(sports_from_events)
+            print(f"   /events tag_slug: {added_ev} mercados em {min_h:.0f}h-{max_h:.0f}h")
+
+        # ── 2. Busca geral dentro da janela temporal — /events + /markets ──
+        # 2a. /events sem tag (todos os tipos de evento)
+        general_from_events = self._fetch_events_by_api_filter(min_h, max_h, tag_slugs=None)
+        added_general_ev = _add_unique(general_from_events)
+        print(f"   /events geral: {added_general_ev} mercados novos em {min_h:.0f}h-{max_h:.0f}h")
+
+        # 2b. /markets sem tag (todos os mercados standalone)
+        general_from_markets = self._fetch_markets_by_api_filter(min_h, max_h, tag_slugs=None)
+        added_general_mk = _add_unique(general_from_markets)
+        added_general = added_general_ev + added_general_mk
+        print(f"   /markets geral: {added_general_mk} mercados novos em {min_h:.0f}h-{max_h:.0f}h")
+
+        # ── 3. Filtro de keyword client-side (se modo keyword) ──
+        if keywords and mode != "all":
+            # Filtra para manter apenas mercados relevantes às keywords
+            def _passes_kw(m: dict) -> bool:
+                text = f"{m.get('question','')}{m.get('description','')}".lower()
+                # Tags do evento também podem conter a keyword
+                tags_text = " ".join(str(t) for t in (m.get("tags") or []))
+                full_text = f"{text} {tags_text}".lower()
+                return any(kw in full_text for kw in keywords)
+
+            # Os mercados de sports (via tag_slug) já são relevantes — não filtramos
+            # Os mercados gerais precisam do filtro de keyword
+            sports_count = len(final) - added_general
+            sports_part = final[:sports_count]  # já filtrados por tag_slug
+            general_part = final[sports_count:]  # precisam filtro keyword
+
+            filtered_general = [m for m in general_part if _passes_kw(m)]
+            final = sports_part + filtered_general
+            print(f"   Filtro keyword nos gerais: {len(general_part)} -> {len(filtered_general)}")
+
+        # ── 4. Ordenação Final por Atividade ──
+        final.sort(key=lambda x: x.get("_activity_score", 0), reverse=True)
+
+        print(f"   TOTAL FINAL: {len(final)} mercados dentro de {min_h:.0f}h-{max_h:.0f}h (ordenados por atividade)")
+
+        # Diagnóstico resumido
+        for m in final[:5]:
+            h = _hours_until_end(m.get("endDate", ""))
+            hstr = f"{h:.1f}h" if h is not None else "?"
+            liq = float(m.get("liquidity") or 0.0)
+            vol = float(m.get("volume24h") or 0.0)
+            print(f"     [{hstr}] {m.get('question','?')[:65]} (Liq: ${liq:,.0f} | Vol24h: ${vol:,.0f})")
+
+        return final
 
     def get_sampling_simplified_markets(self) -> "list[SimpleEvent]":
         markets = []
@@ -309,9 +693,9 @@ class Polymarket:
         self,
         market_token: str,
         amount: float,
-        nonce: str = str(round(time.time())),  # for cancellations
+        nonce: str = str(round(time.time())),
         side: str = "BUY",
-        expiration: str = "0",  # timestamp after which order expires
+        expiration: str = "0",
     ):
         signer = Signer(self.private_key)
         builder = OrderBuilder(self.exchange_address, self.chain_id, signer)
@@ -352,130 +736,30 @@ class Polymarket:
         return resp
 
     def get_usdc_balance(self) -> float:
+        if self.paper_trade:
+            try:
+                import json as _json
+                log_path = Path("paper_trades.json")
+                if log_path.exists():
+                    with open(log_path) as f:
+                        trades = _json.load(f)
+                    spent = sum(t.get("simulated_usdc_amount", 0) for t in trades if not t.get("resolved"))
+                    return max(0.0, self.paper_balance - spent)
+            except Exception:
+                pass
+            return self.paper_balance
         balance_res = self.usdc.functions.balanceOf(
             self.get_address_for_private_key()
         ).call()
         return float(balance_res / 10e5)
 
 
-def test():
-    host = "https://clob.polymarket.com"
-    key = os.getenv("POLYGON_WALLET_PRIVATE_KEY")
-    print(key)
-    chain_id = POLYGON
-
-    # Create CLOB client and get/set API credentials
-    client = ClobClient(host, key=key, chain_id=chain_id)
-    client.set_api_creds(client.create_or_derive_api_creds())
-
-    creds = ApiCreds(
-        api_key=os.getenv("CLOB_API_KEY"),
-        api_secret=os.getenv("CLOB_SECRET"),
-        api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
-    )
-    chain_id = AMOY
-    client = ClobClient(host, key=key, chain_id=chain_id, creds=creds)
-
-    print(client.get_markets())
-    print(client.get_simplified_markets())
-    print(client.get_sampling_markets())
-    print(client.get_sampling_simplified_markets())
-    print(client.get_market("condition_id"))
-
-    print("Done!")
-
-
-def gamma():
-    url = "https://gamma-com"
-    markets_url = url + "/markets"
-    res = httpx.get(markets_url)
-    code = res.status_code
-    if code == 200:
-        markets: list[SimpleMarket] = []
-        data = res.json()
-        for market in data:
-            try:
-                market_data = {
-                    "id": int(market["id"]),
-                    "question": market["question"],
-                    # "start": market['startDate'],
-                    "end": market["endDate"],
-                    "description": market["description"],
-                    "active": market["active"],
-                    "deployed": market["deployed"],
-                    "funded": market["funded"],
-                    # "orderMinSize": float(market['orderMinSize']) if market['orderMinSize'] else 0,
-                    # "orderPriceMinTickSize": float(market['orderPriceMinTickSize']),
-                    "rewardsMinSize": float(market["rewardsMinSize"]),
-                    "rewardsMaxSpread": float(market["rewardsMaxSpread"]),
-                    "volume": float(market["volume"]),
-                    "spread": float(market["spread"]),
-                    "outcome_a": str(market["outcomes"][0]),
-                    "outcome_b": str(market["outcomes"][1]),
-                    "outcome_a_price": str(market["outcomePrices"][0]),
-                    "outcome_b_price": str(market["outcomePrices"][1]),
-                }
-                markets.append(SimpleMarket(**market_data))
-            except Exception as err:
-                print(f"error {err} for market {id}")
-        pdb.set_trace()
-    else:
-        raise Exception()
-
-
 def main():
-    # auth()
-    # test()
-    # gamma()
     print(Polymarket().get_all_events())
 
 
 if __name__ == "__main__":
     load_dotenv()
-
     p = Polymarket()
-
-    # k = p.get_api_key()
-    # m = p.get_sampling_simplified_markets()
-
-    # print(m)
-    # m = p.get_market('11015470973684177829729219287262166995141465048508201953575582100565462316088')
-
-    # t = m[0]['token_id']
-    # o = p.get_orderbook(t)
-    # pdb.set_trace()
-
-    """
-    
-    (Pdb) pprint(o)
-            OrderBookSummary(
-                market='0x26ee82bee2493a302d21283cb578f7e2fff2dd15743854f53034d12420863b55', 
-                asset_id='11015470973684177829729219287262166995141465048508201953575582100565462316088', 
-                bids=[OrderSummary(price='0.01', size='600005'), OrderSummary(price='0.02', size='200000'), ...
-                asks=[OrderSummary(price='0.99', size='100000'), OrderSummary(price='0.98', size='200000'), ...
-            )
-    
-    """
-
-    # https://polygon-rpc.com
-
-    test_market_token_id = (
-        "101669189743438912873361127612589311253202068943959811456820079057046819967115"
-    )
-    test_market_data = p.get_market(test_market_token_id)
-
-    # test_size = 0.0001
-    test_size = 1
-    test_side = BUY
-    test_price = float(ast.literal_eval(test_market_data["outcome_prices"])[0])
-
-    # order = p.execute_order(
-    #    test_price,
-    #    test_size,
-    #    test_side,
-    #    test_market_token_id,
-    # )
-
-    # order = p.execute_market_order(test_price, test_market_token_id)
-
     balance = p.get_usdc_balance()
+    print(f"Balance: {balance}")
